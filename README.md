@@ -1,4 +1,4 @@
-# BingPpang POS — Netlify + Supabase
+# Netlify + Supabase
 
 This version is designed for deployment to Netlify and shared use across multiple iPads.
 
