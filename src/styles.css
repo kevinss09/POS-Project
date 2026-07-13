@@ -521,3 +521,55 @@ button:disabled {
   .menu-setting-row { grid-template-columns: 1fr 90px; }
   .menu-setting-row .toggle { grid-column: 1 / -1; }
 }
+
+.bundle-hint {
+  margin: 0 0 14px;
+  padding: 11px 13px;
+  border-radius: 12px;
+  background: #fff3cc;
+  color: #725616;
+  font-weight: 700;
+}
+
+.discount-line {
+  color: var(--success);
+}
+
+.mixed-badge {
+  display: inline-block;
+  margin-bottom: 10px;
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: #e8eef9;
+  color: #35517a;
+  font-size: .82rem;
+  font-weight: 800;
+}
+
+.cancel-order-btn {
+  width: 100%;
+  margin-top: 8px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid #efcaca;
+  font-size: .82rem;
+  font-weight: 800;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: .78rem;
+  font-weight: 900;
+  text-transform: capitalize;
+}
+.status-pill.completed { background: #e6f3ea; color: var(--success); }
+.status-pill.canceled { background: #f8dfdf; color: var(--danger); }
+.canceled-row { opacity: .72; }
+
+@media (max-width: 1100px) {
+  .nav button { padding: 10px 11px; font-size: .9rem; }
+}
