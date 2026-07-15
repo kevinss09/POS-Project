@@ -27,9 +27,16 @@ let lastSubmittedOrder = null;
 let toastTimer = null;
 let loading = true;
 let connectionStatus = 'connecting';
+let isSubmittingOrder = false;
+let previousRoute = route;
 
 window.addEventListener('hashchange', () => {
-  route = location.hash.replace('#', '') || 'pos';
+  const nextRoute = location.hash.replace('#', '') || 'pos';
+  if (previousRoute === 'checkout' && nextRoute !== 'checkout') {
+    lastSubmittedOrder = null;
+  }
+  previousRoute = nextRoute;
+  route = nextRoute;
   render();
 });
 
@@ -45,20 +52,44 @@ function escapeHtml(value) {
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
 }
-function rawCartSubtotal() { return cart.reduce((sum, item) => sum + item.price * item.quantity, 0); }
+// Keep all checkout calculations in integer cents to avoid floating-point rounding bugs.
+function toCents(value) { return Math.round((Number(value) + Number.EPSILON) * 100); }
+function fromCents(value) { return value / 100; }
+function rawCartSubtotalCents() { return cart.reduce((sum, item) => sum + toCents(item.price) * item.quantity, 0); }
+function rawCartSubtotal() { return fromCents(rawCartSubtotalCents()); }
 function bungeoppangQuantity() { return cart.filter(i => i.category === 'Bungeoppang').reduce((sum, i) => sum + i.quantity, 0); }
 function bundleCount() { return Math.floor(bungeoppangQuantity() / 5); }
-function bundleDiscount() { return bundleCount() * 2.5; }
-function cartSubtotal() { return Math.max(0, rawCartSubtotal() - bundleDiscount()); }
-function cartTax() { return state.settings.taxEnabled ? cartSubtotal() * Number(state.settings.taxRate || 0) / 100 : 0; }
-function cartTotal() { return cartSubtotal() + cartTax(); }
+function bundleDiscountCents() { return bundleCount() * 250; }
+function bundleDiscount() { return fromCents(bundleDiscountCents()); }
+function cartSubtotalCents() { return Math.max(0, rawCartSubtotalCents() - bundleDiscountCents()); }
+function cartSubtotal() { return fromCents(cartSubtotalCents()); }
+function cartTaxCents() { return state.settings.taxEnabled ? Math.round(cartSubtotalCents() * Number(state.settings.taxRate || 0) / 100) : 0; }
+function cartTax() { return fromCents(cartTaxCents()); }
+function cartTotalCents() { return cartSubtotalCents() + cartTaxCents(); }
+function cartTotal() { return fromCents(cartTotalCents()); }
 function cartCount() { return cart.reduce((sum, item) => sum + item.quantity, 0); }
-function activeOrders() { return state.orders.filter(o => o.status === 'preparing').sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)); }
-function historyOrders() { return state.orders.filter(o => o.status !== 'preparing').sort((a, b) => new Date(b.completedAt || b.canceledAt || b.createdAt) - new Date(a.completedAt || a.canceledAt || a.createdAt)); }
+function activeOrders() { return state.orders.filter(o => o.status === 'preparing' || o.status === 'ready').sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)); }
+function historyOrders() { return state.orders.filter(o => o.status === 'completed' || o.status === 'canceled').sort((a, b) => new Date(b.completedAt || b.canceledAt || b.createdAt) - new Date(a.completedAt || a.canceledAt || a.createdAt)); }
 function stationOrders(station) {
   const completedKey = station === 'Bungeoppang' ? 'bungeoppangCompleted' : 'bingsuCompleted';
   const requiredKey = station === 'Bungeoppang' ? 'bungeoppangRequired' : 'bingsuRequired';
   return activeOrders().filter(o => o[requiredKey] && !o[completedKey]);
+}
+
+async function fetchAllOrders() {
+  const pageSize = 1000;
+  const allOrders = [];
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('*, order_items(*)')
+      .order('created_at', { ascending: false })
+      .range(from, from + pageSize - 1);
+    if (error) return { data: null, error };
+    allOrders.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+  }
+  return { data: allOrders, error: null };
 }
 
 async function loadState() {
@@ -67,7 +98,7 @@ async function loadState() {
   const [settingsResult, menuResult, ordersResult] = await Promise.all([
     supabase.from('app_settings').select('*').eq('id', 1).single(),
     supabase.from('menu_items').select('*').order('sort_order'),
-    supabase.from('orders').select('*, order_items(*)').order('created_at', { ascending: false }).limit(2000)
+    fetchAllOrders()
   ]);
   const error = settingsResult.error || menuResult.error || ordersResult.error;
   if (error) {
@@ -148,6 +179,7 @@ function renderShell(content) {
     ['pos', 'Cashier'],
     ['prep-bungeoppang', `Bungeoppang (${stationOrders('Bungeoppang').length})`],
     ['prep-bingsu', `Bingsu (${stationOrders('Bingsu').length})`],
+    ['send-off', `Send Off (${activeOrders().length})`],
     ['history', 'History'],
     ['settings', 'Settings']
   ];
@@ -157,6 +189,7 @@ function renderShell(content) {
 function render() {
   if (route === 'prep-bungeoppang') return renderStation('Bungeoppang');
   if (route === 'prep-bingsu') return renderStation('Bingsu');
+  if (route === 'send-off') return renderSendOff();
   if (route === 'history') return renderHistory();
   if (route === 'settings') return renderSettings();
   if (route === 'checkout') return renderCheckout();
@@ -191,14 +224,14 @@ function renderPOS() {
 window.selectPayment = mode => { checkoutMode = mode; render(); };
 window.setCashReceived = value => {
   cashReceived = value;
-  const received = Number(cashReceived || 0);
-  const total = cartTotal();
+  const receivedCents = toCents(cashReceived || 0);
+  const totalCents = cartTotalCents();
   const input = document.querySelector('.money-input');
   if (input && input.value !== String(value)) input.value = value;
   const changeEl = document.getElementById('change-due');
   const submitBtn = document.getElementById('submit-order-btn');
-  if (changeEl) changeEl.textContent = money(Math.max(0, received - total));
-  if (submitBtn && checkoutMode === 'cash') submitBtn.disabled = received < total;
+  if (changeEl) changeEl.textContent = money(fromCents(Math.max(0, receivedCents - totalCents)));
+  if (submitBtn && checkoutMode === 'cash') submitBtn.disabled = isSubmittingOrder || receivedCents < totalCents;
 };
 window.startNextOrder = () => { lastSubmittedOrder = null; location.hash = 'pos'; };
 
@@ -206,28 +239,47 @@ function renderCheckout() {
   if (cart.length === 0 && !lastSubmittedOrder) { location.hash = 'pos'; return; }
   if (lastSubmittedOrder) return renderShell(`<section class="panel checkout-card"><div class="success-box"><h2>Order ${orderNumber(lastSubmittedOrder.orderNumber)} submitted</h2><p>It has been sent to the correct preparation station${lastSubmittedOrder.bungeoppangRequired && lastSubmittedOrder.bingsuRequired ? 's' : ''}.</p></div><button class="primary" onclick="startNextOrder()">Start Next Order</button></section>`);
   const total = cartTotal();
-  const received = Number(cashReceived || 0);
-  const change = Math.max(0, received - total);
+  const receivedCents = toCents(cashReceived || 0);
+  const totalCents = cartTotalCents();
+  const change = fromCents(Math.max(0, receivedCents - totalCents));
   const discount = bundleDiscount();
-  renderShell(`<section class="panel checkout-card"><h2>Checkout</h2><div class="totals"><div class="total-line"><span>Items</span><strong>${money(rawCartSubtotal())}</strong></div>${discount > 0 ? `<div class="total-line discount-line"><span>Bundle discount</span><strong>−${money(discount)}</strong></div>` : ''}<div class="total-line"><span>${state.settings.taxEnabled ? `GST (${state.settings.taxRate}%)` : 'Tax'}</span><strong>${money(cartTax())}</strong></div><div class="total-line grand"><span>Total</span><span>${money(total)}</span></div></div><div class="payment-options"><button class="payment-option ${checkoutMode === 'cash' ? 'active' : ''}" onclick="selectPayment('cash')">Cash</button><button class="payment-option ${checkoutMode === 'card' ? 'active' : ''}" onclick="selectPayment('card')">Card / Square</button></div>${checkoutMode === 'cash' ? `<label>Cash received<input class="money-input" inputmode="decimal" value="${escapeHtml(cashReceived)}" oninput="setCashReceived(this.value)" placeholder="0.00"></label><div class="quick-cash"><button onclick="setCashReceived('${total.toFixed(2)}')">Exact</button>${[20, 50, 100].map(v => `<button onclick="setCashReceived('${v}')">${money(v)}</button>`).join('')}</div><div class="notice"><strong>Change due: <span id="change-due">${money(change)}</span></strong></div>` : ''}${checkoutMode === 'card' ? `<div class="notice">Open Square and charge <strong>${money(total)}</strong>. Return only after payment succeeds.</div>` : ''}<button id="submit-order-btn" class="primary" ${!checkoutMode || (checkoutMode === 'cash' && received < total) ? 'disabled' : ''} onclick="submitOrder()">Payment Received — Submit Order</button><button class="secondary" style="width:100%;margin-top:8px" onclick="location.hash='pos'">Back to Order</button></section>`);
+  renderShell(`<section class="panel checkout-card"><h2>Checkout</h2><div class="totals"><div class="total-line"><span>Items</span><strong>${money(rawCartSubtotal())}</strong></div>${discount > 0 ? `<div class="total-line discount-line"><span>Bundle discount</span><strong>−${money(discount)}</strong></div>` : ''}<div class="total-line"><span>${state.settings.taxEnabled ? `GST (${state.settings.taxRate}%)` : 'Tax'}</span><strong>${money(cartTax())}</strong></div><div class="total-line grand"><span>Total</span><span>${money(total)}</span></div></div><div class="payment-options"><button class="payment-option ${checkoutMode === 'cash' ? 'active' : ''}" onclick="selectPayment('cash')">Cash</button><button class="payment-option ${checkoutMode === 'card' ? 'active' : ''}" onclick="selectPayment('card')">Card / Square</button></div>${checkoutMode === 'cash' ? `<label>Cash received<input class="money-input" inputmode="decimal" value="${escapeHtml(cashReceived)}" oninput="setCashReceived(this.value)" placeholder="0.00"></label><div class="quick-cash"><button onclick="setCashReceived('${fromCents(totalCents).toFixed(2)}')">Exact</button>${[20, 50, 100].map(v => `<button onclick="setCashReceived('${v}')">${money(v)}</button>`).join('')}</div><div class="notice"><strong>Change due: <span id="change-due">${money(change)}</span></strong></div>` : ''}${checkoutMode === 'card' ? `<div class="notice">Open Square and charge <strong>${money(total)}</strong>. Return only after payment succeeds.</div>` : ''}<button id="submit-order-btn" class="primary" ${isSubmittingOrder || !checkoutMode || (checkoutMode === 'cash' && receivedCents < totalCents) ? 'disabled' : ''} onclick="submitOrder()">Payment Received — Submit Order</button><button class="secondary" style="width:100%;margin-top:8px" onclick="location.hash='pos'">Back to Order</button></section>`);
 }
 
 window.submitOrder = async () => {
-  const { data, error } = await supabase.rpc('create_pos_order', {
-    p_items: cart.map(i => ({ menu_item_id: i.menuItemId, quantity: i.quantity })),
-    p_note: orderNote,
-    p_payment_method: checkoutMode,
-    p_cash_received: checkoutMode === 'cash' ? Number(cashReceived) : null
-  });
-  if (error) return showToast(error.message);
-  await loadState();
-  const order = state.orders.find(o => o.id === data);
-  lastSubmittedOrder = order || { orderNumber: '?', bungeoppangRequired: false, bingsuRequired: false };
-  cart = [];
-  orderNote = '';
-  checkoutMode = null;
-  cashReceived = '';
-  render();
+  if (isSubmittingOrder) return;
+  if (cart.length === 0 || !checkoutMode) return;
+  if (checkoutMode === 'cash' && toCents(cashReceived || 0) < cartTotalCents()) {
+    return showToast('Cash received is less than the order total.');
+  }
+
+  isSubmittingOrder = true;
+  const submitButton = document.getElementById('submit-order-btn');
+  if (submitButton) {
+    submitButton.disabled = true;
+    submitButton.textContent = 'Submitting…';
+  }
+
+  try {
+    const { data, error } = await supabase.rpc('create_pos_order', {
+      p_items: cart.map(i => ({ menu_item_id: i.menuItemId, quantity: i.quantity })),
+      p_note: orderNote,
+      p_payment_method: checkoutMode,
+      p_cash_received: checkoutMode === 'cash' ? fromCents(toCents(cashReceived)) : null
+    });
+    if (error) return showToast(error.message);
+
+    await loadState();
+    const order = state.orders.find(o => o.id === data);
+    lastSubmittedOrder = order || { orderNumber: '?', bungeoppangRequired: false, bingsuRequired: false };
+    cart = [];
+    orderNote = '';
+    checkoutMode = null;
+    cashReceived = '';
+    render();
+  } finally {
+    isSubmittingOrder = false;
+  }
 };
 
 function elapsed(iso) {
@@ -241,7 +293,7 @@ function elapsed(iso) {
 window.completeStation = async (id, number, station) => {
   const { error } = await supabase.rpc('complete_pos_station', { p_order_id: id, p_station: station });
   if (error) return showToast(error.message);
-  showToast(`${station} for order ${orderNumber(number)} completed.`, 'Undo', async () => {
+  showToast(`${station} for order ${orderNumber(number)} is ready.`, 'Undo', async () => {
     const result = await supabase.rpc('reopen_pos_station', { p_order_id: id, p_station: station });
     if (result.error) showToast(result.error.message);
   });
@@ -251,7 +303,7 @@ window.cancelSubmittedOrder = async (id, number, paymentMethod) => {
   const refundText = paymentMethod === 'card'
     ? 'Make sure to refund the customer separately in Square.'
     : 'Make sure to return the customer’s cash if needed.';
-  const confirmed = confirm(`Cancel order ${orderNumber(number)}?\n\n${refundText}\n\nThis removes it from both preparation pages but keeps it in History.`);
+  const confirmed = confirm(`Cancel order ${orderNumber(number)}?\n\n${refundText}\n\nThis removes it from preparation and Send Off, but keeps it in History.`);
   if (!confirmed) return;
   const { error } = await supabase.rpc('cancel_pos_order', { p_order_id: id });
   if (error) return showToast(error.message);
@@ -264,7 +316,36 @@ function renderStation(station) {
   renderShell(`<section><h2>${station} Preparation</h2>${orders.length === 0 ? `<div class="panel empty-state"><h3>No ${station.toLowerCase()} orders</h3><p>Paid ${station.toLowerCase()} items will appear here automatically.</p></div>` : `<div class="orders-grid">${orders.map(order => {
     const stationItems = order.items.filter(i => i.category === station);
     const isMixed = order.items.some(i => i.category === otherStation);
-    return `<article class="panel order-card"><header><div class="order-number">${orderNumber(order.orderNumber)}</div><div class="order-time">${elapsed(order.createdAt)}</div></header>${isMixed ? `<div class="mixed-badge">Mixed order · also has ${otherStation}</div>` : ''}<div class="order-items">${stationItems.map(i => `<div class="order-item-line"><strong>${i.quantity} × ${escapeHtml(i.name)}</strong><small>${escapeHtml(i.category)}</small></div>`).join('')}</div>${order.note ? `<div class="order-note"><strong>Note:</strong> ${escapeHtml(order.note)}</div>` : ''}<button class="complete-btn" onclick="completeStation('${order.id}',${order.orderNumber},'${station}')">Complete ${station}</button><button class="cancel-order-btn" onclick="cancelSubmittedOrder('${order.id}',${order.orderNumber},'${order.paymentMethod}')">Cancel order</button></article>`;
+    return `<article class="panel order-card"><header><div class="order-number">${orderNumber(order.orderNumber)}</div><div class="order-time">${elapsed(order.createdAt)}</div></header>${isMixed ? `<div class="mixed-badge">Mixed order · also has ${otherStation}</div>` : ''}<div class="order-items">${stationItems.map(i => `<div class="order-item-line"><strong>${i.quantity} × ${escapeHtml(i.name)}</strong><small>${escapeHtml(i.category)}</small></div>`).join('')}</div>${order.note ? `<div class="order-note"><strong>Note:</strong> ${escapeHtml(order.note)}</div>` : ''}<button class="complete-btn" onclick="completeStation('${order.id}',${order.orderNumber},'${station}')">Mark ${station} Ready</button><button class="cancel-order-btn" onclick="cancelSubmittedOrder('${order.id}',${order.orderNumber},'${order.paymentMethod}')">Cancel order</button></article>`;
+  }).join('')}</div>`}</section>`);
+}
+
+
+function readinessBadge(required, ready, label) {
+  if (!required) return `<div class="readiness-row"><span>${label}</span><span class="readiness-badge not-required">Not required</span></div>`;
+  return `<div class="readiness-row"><span>${label}</span><span class="readiness-badge ${ready ? 'ready' : 'preparing'}">${ready ? 'Ready ✓' : 'Preparing'}</span></div>`;
+}
+
+window.finishSendOffOrder = async (id, number) => {
+  const confirmed = confirm(`Finish order ${orderNumber(number)}?\n\nConfirm that the complete order has been handed to the customer.`);
+  if (!confirmed) return;
+  const { error } = await supabase.rpc('finish_pos_order', { p_order_id: id });
+  if (error) return showToast(error.message);
+  showToast(`Order ${orderNumber(number)} sent off and moved to History.`);
+};
+
+function renderSendOff() {
+  const orders = activeOrders().sort((a, b) => {
+    const aReady = a.status === 'ready' ? 0 : 1;
+    const bReady = b.status === 'ready' ? 0 : 1;
+    return aReady - bReady || new Date(a.createdAt) - new Date(b.createdAt);
+  });
+
+  renderShell(`<section><h2>Send Off</h2><p class="page-subtitle">Collect each order, confirm all required stations are ready, then hand it to the customer.</p>${orders.length === 0 ? `<div class="panel empty-state"><h3>No orders waiting for send off</h3><p>Submitted orders will appear here automatically.</p></div>` : `<div class="orders-grid sendoff-grid">${orders.map(order => {
+    const fullyReady = order.status === 'ready';
+    const bungeoppangItems = order.items.filter(i => i.category === 'Bungeoppang');
+    const bingsuItems = order.items.filter(i => i.category === 'Bingsu');
+    return `<article class="panel order-card sendoff-card ${fullyReady ? 'fully-ready' : ''}"><header><div><div class="order-number">${orderNumber(order.orderNumber)}</div>${fullyReady ? '<div class="ready-to-send">READY TO SEND OFF</div>' : ''}</div><div class="order-time">${elapsed(order.createdAt)}</div></header><div class="sendoff-items">${bungeoppangItems.length ? `<div class="station-section"><h3>Bungeoppang</h3>${bungeoppangItems.map(i => `<div class="order-item-line"><strong>${i.quantity} × ${escapeHtml(i.name)}</strong></div>`).join('')}</div>` : ''}${bingsuItems.length ? `<div class="station-section"><h3>Bingsu</h3>${bingsuItems.map(i => `<div class="order-item-line"><strong>${i.quantity} × ${escapeHtml(i.name)}</strong></div>`).join('')}</div>` : ''}</div>${order.note ? `<div class="order-note"><strong>Note:</strong> ${escapeHtml(order.note)}</div>` : ''}<div class="readiness-list">${readinessBadge(order.bungeoppangRequired, order.bungeoppangCompleted, 'Bungeoppang')}${readinessBadge(order.bingsuRequired, order.bingsuCompleted, 'Bingsu')}</div><button class="complete-btn sendoff-finish" ${fullyReady ? '' : 'disabled'} onclick="finishSendOffOrder('${order.id}',${order.orderNumber})">Finish Order</button><button class="cancel-order-btn" onclick="cancelSubmittedOrder('${order.id}',${order.orderNumber},'${order.paymentMethod}')">Cancel order</button></article>`;
   }).join('')}</div>`}</section>`);
 }
 
@@ -319,7 +400,7 @@ function renderSettings() {
 }
 
 setInterval(() => {
-  if (route === 'prep-bungeoppang' || route === 'prep-bingsu') render();
+  if (route === 'prep-bungeoppang' || route === 'prep-bingsu' || route === 'send-off') render();
 }, 15000);
 
 async function init() {
