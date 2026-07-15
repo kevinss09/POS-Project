@@ -322,15 +322,33 @@ function renderStation(station) {
 
 
 function readinessBadge(required, ready, label) {
-  if (!required) return `<div class="readiness-row"><span>${label}</span><span class="readiness-badge not-required">Not required</span></div>`;
+  if (!required) return '';
   return `<div class="readiness-row"><span>${label}</span><span class="readiness-badge ${ready ? 'ready' : 'preparing'}">${ready ? 'Ready ✓' : 'Preparing'}</span></div>`;
 }
 
+const finishingSendOffOrders = new Set();
+
 window.finishSendOffOrder = async (id, number) => {
-  const confirmed = confirm(`Finish order ${orderNumber(number)}?\n\nConfirm that the complete order has been handed to the customer.`);
-  if (!confirmed) return;
+  if (finishingSendOffOrders.has(id)) return;
+  finishingSendOffOrders.add(id);
+
+  const button = document.activeElement;
+  if (button instanceof HTMLButtonElement) {
+    button.disabled = true;
+    button.textContent = 'Finishing…';
+  }
+
   const { error } = await supabase.rpc('finish_pos_order', { p_order_id: id });
-  if (error) return showToast(error.message);
+
+  if (error) {
+    finishingSendOffOrders.delete(id);
+    if (button instanceof HTMLButtonElement) {
+      button.disabled = false;
+      button.textContent = 'Finish Order';
+    }
+    return showToast(error.message);
+  }
+
   showToast(`Order ${orderNumber(number)} sent off and moved to History.`);
 };
 
